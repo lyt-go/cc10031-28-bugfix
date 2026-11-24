@@ -7,6 +7,12 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.reconciliation import (
+    build_replay_records,
+    read_replay_result,
+    reconcile_point_window,
+    verify_replay_sources,
+)
 from app.store import store
 
 
@@ -101,3 +107,94 @@ class UploadBatchService(BaseModuleService):
             "completed_at": time.time(),
             "auto_triggers": triggers,
         }
+
+    def reconcile_replay_window(self, batch_id: int, replay_id: int) -> dict[str, Any]:
+        """批量上送端按重采选中的实际观测核对来源（与重采工作台同一对账口径）。
+
+        按重采任务的测点与申请时段给出：
+        - 该时段原始实收（edge_samples 落盘、可核实的原始观测）；
+        - 已被某份回放采用的记录（实际回放成果行，含采用的出处与量纲）；
+        - 时段外样本：仍可在原上送中回查，但不记成这次重采交付；
+        - 按原出处的复验结论，供故障恢复后核对。
+        """
+        batch = store.find(self.MODULE, batch_id)
+        if batch is None:
+            return {"error": f"上送批次 {batch_id} 不存在"}
+        replay = store.find("range_replay", replay_id)
+        if replay is None:
+            return {"error": f"重采任务 {replay_id} 不存在"}
+
+        batch_key = batch["批次编号"]
+        shard = batch.get("分片范围", batch_key)
+        point_key = replay["测点编号"]
+        start = replay.get("起始时刻")
+        end = replay.get("截止时刻")
+        if shard != point_key:
+            return {
+                "error": (
+                    f"上送批次分片 {shard} 与重采测点 {point_key} 不一致，"
+                    "对账必须针对同一测点时段"
+                )
+            }
+
+        audit = reconcile_point_window(self._data_root(), point_key, start, end)
+        # 与重采工作台同一构造逻辑，确保两边对"范围内观测"的认定完全一致
+        expected_rows, outside = build_replay_records(
+            self._data_root(), point_key, start, end,
+            replay_id=replay["重采编号"],
+            reason=replay.get("重采原因", "传感器故障"),
+            overwrite_mode=replay.get("覆盖方式", "追加"),
+            replayed_at=time.time(),
+        )
+        replay_rows = read_replay_result(self._data_root(), replay["重采编号"])
+        verification = verify_replay_sources(
+            self._data_root(), point_key, replay_rows
+        )
+        adopted_ts = {row.get("original_timestamp") for row in replay_rows}
+
+        raw_received = [
+            {
+                "point": point_key,
+                "timestamp": r.get("timestamp"),
+                "raw_value_mV": r.get("raw_value_mV", r.get("raw_value")),
+                "unit": "mV",
+                "source_file": audit["edge_file"],
+                "adopted_by_replay": r.get("timestamp") in adopted_ts,
+            }
+            for r in audit["raw_received"]
+        ]
+        adopted_records = [
+            {
+                "timestamp": row.get("original_timestamp"),
+                "replay_value": row.get("replay_value"),
+                "replay_unit": row.get("replay_unit"),
+                "source_kind": row.get("source_kind"),
+                "source_file": row.get("source_file"),
+                "source_calibrate_id": row.get("source_calibrate_id"),
+                "source_checksum": row.get("source_checksum"),
+            }
+            for row in replay_rows
+        ]
+        result = {
+            "batch_key": batch_key,
+            "shard": shard,
+            "replay_id": replay["重采编号"],
+            "window_start": start,
+            "window_end": end,
+            "raw_received_count": len(raw_received),
+            "raw_received": raw_received,
+            "adopted_count": len(adopted_records),
+            "adopted_records": adopted_records,
+            "out_of_window_samples": len(outside),
+            "out_of_window_timestamps": [r.get("timestamp") for r in outside],
+            "out_of_window_note": "范围外样本仍可在原上送边缘文件回查，不计入本次重采交付",
+            "expected_in_window_count": len(expected_rows),
+            "source_verification": verification,
+            "reconciled_at": time.time(),
+        }
+        # 对账结论落盘到上送批次目录，作为可核实的交付凭证
+        self._write_jsonl(
+            self._data_dir("upload_batches") / f"{batch_key}_replay_reconcile.jsonl",
+            [json.loads(json.dumps(result, ensure_ascii=False, default=str))]
+        )
+        return result

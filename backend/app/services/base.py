@@ -107,6 +107,10 @@ class BaseModuleService:
         _ensure_dir(p)
         return p
 
+    def _data_root(self) -> Path:
+        """返回当前生效的数据根目录（调用时解析，兼容测试中对 DATA_ROOT 的 patch）。"""
+        return DATA_ROOT
+
     def _write_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
         """将记录列表按行写入 JSONL 文件，返回实际写入条数。"""
         _ensure_dir(filepath.parent)
@@ -116,6 +120,18 @@ class BaseModuleService:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
                 written += 1
         return written
+
+    def _replace_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
+        """以本次结果整体替换 JSONL 文件，返回实际写入条数。
+
+        重采/对账类产物只代表本次申请范围的交付集，必须整文件替换，
+        避免上一次（含时段外样本的）错误记录残留在结果里，也保证重试幂等。
+        """
+        _ensure_dir(filepath.parent)
+        with open(filepath, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        return len(records)
 
     def _read_jsonl(self, filepath: Path) -> list[dict[str, Any]]:
         """从 JSONL 文件逐行读取记录列表，用于跨模块共享数据产物。"""
